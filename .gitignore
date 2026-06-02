@@ -1,3 +1,15 @@
+/rag_data/
+/collections/
+/aliases/
+/.deleted/
 .env
+app.ipynb
+new_app.py
+raft_state.json
+qdrant.exe
+/storage/
+.qdrant-initialized
+/snapshots/
 __pycache__/
 *.pyc
+
