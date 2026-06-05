@@ -1,2 +1,4 @@
 streamlit
 PyPDF2
+langchain-text-splitters
+beautifulsoup4
