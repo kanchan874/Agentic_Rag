@@ -1,5 +1,5 @@
-# Agentic RAG System - Build 60
-# Iteration: 2026-07-30
+# Agentic RAG System - Build 61
+# Updated: 2026-07-31
 
 import streamlit as st
 import PyPDF2
@@ -212,3 +212,92 @@ def answer_question(question, client, collection_name, top_k=3):
         st.warning("Please enter a question.")
         return
 
+    def search(text: str):
+        query_embedding = get_embeddings(text, api_key=st.session_state.openai_api_key)[
+            0
+        ]["embedding"]
+        return client.search(
+            collection_name=collection_name, query_vector=query_embedding, limit=top_k
+        )
+
+    def format_docs(docs):
+        formatted_chunks = []
+        for doc in docs:
+            source_info = ""
+            if doc.payload["metadata"]["source"] == "pdf_dataset":
+                source_info = (
+                    f"\nSource: PDF file {doc.payload['metadata']['filename']}"
+                )
+            else:
+                source_info = f"\nSource: Web article {doc.payload['metadata']['url']}"
+            formatted_chunks.append(doc.payload["content"] + source_info)
+        return "\n\n".join(formatted_chunks)
+
+    decision_system_prompt = """Your job is decide if a given question can be answered with a given context. 
+    If context can answer the question return 1.
+    If not return 0.
+    Context: {context}
+    """
+
+    system_prompt = """You are an expert in answering questions. Provide answers based **exclusively** on the given context. 
+
+        **Rules:**
+        1. If the question cannot be answered using the context, respond only with: "I don't know."
+        2. Do **not** infer, assume, or add information not explicitly provided in the context.
+        3. Your answers must be:
+        - **Concise**: Avoid unnecessary details.
+        - **Informative**: Focus on actionable and precise responses.
+        4. Format your response in **Markdown**.
+
+        **Context:** {context}
+
+    """
+
+    user_prompt = """
+    Question: {question}
+    Answer:"""
+
+    with st.spinner("Searching for relevant information..."):
+        results = search(question)
+        context = format_docs(results)
+
+        response = completion(
+            model="gpt-4o-mini",
+            messages=[
+                {
+                    "content": decision_system_prompt.format(context=context),
+                    "role": "system",
+                },
+                {"content": user_prompt.format(question=question), "role": "user"},
+            ],
+            max_tokens=50,
+            api_key=st.session_state.openai_api_key,
+        )
+        has_answer = response.choices[0].message.content
+
+        if has_answer == "1":
+            st.info("Found relevant information in the indexed content")
+            response = completion(
+                model="gpt-4o-mini",
+                messages=[
+                    {
+                        "content": system_prompt.format(context=context),
+                        "role": "system",
+                    },
+                    {"content": user_prompt.format(question=question), "role": "user"},
+                ],
+                max_tokens=1000,
+                api_key=st.session_state.openai_api_key,
+            )
+            st.markdown(response.choices[0].message.content)
+        else:
+            st.info("No relevant information found. Searching online...")
+            results = DDGS().text(question, max_results=5)
+            context = "\n\n".join(doc["body"] for doc in results)
+            st.info("Found online sources. Generating the response...")
+            response = completion(
+                model="gpt-4o-mini",
+                messages=[
+                    {
+                        "content": system_prompt.format(context=context),
+                        "role": "system",
