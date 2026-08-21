@@ -1,5 +1,5 @@
-# Agentic RAG System - Build 81
-# Updated: 2026-08-20
+# Agentic RAG System - Build 82
+# Updated: 2026-08-21
 
 import streamlit as st
 import PyPDF2
