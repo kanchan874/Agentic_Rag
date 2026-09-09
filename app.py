@@ -1,5 +1,5 @@
-# Agentic RAG System - Build 100
-# Updated: 2026-09-08
+# Agentic RAG - Final Integration Stage 101
+# Timestamp: 2026-09-09
 
 import streamlit as st
 import PyPDF2
@@ -301,3 +301,56 @@ def answer_question(question, client, collection_name, top_k=3):
                     {
                         "content": system_prompt.format(context=context),
                         "role": "system",
+                    },
+                    {"content": user_prompt.format(question=question), "role": "user"},
+                ],
+                max_tokens=1000,
+                api_key=st.session_state.openai_api_key,
+            )
+            st.markdown(response.choices[0].message.content)
+
+
+st.title("RAG System with PDF and Website Crawling Support")
+
+default_api_key = os.getenv("OPENAI_API_KEY", "")
+api_key = st.text_input(
+    "Enter your OpenAI API Key:",
+    value=st.session_state.get("openai_api_key", default_api_key),
+    type="password",
+)
+if api_key:
+    st.session_state.openai_api_key = api_key
+
+uploaded_files = st.file_uploader(
+    "Upload PDF files:", accept_multiple_files=True, type=["pdf"]
+)
+
+st.subheader("Website Input")
+web_urls = st.text_input(
+    "Enter website URLs (comma-separated):", placeholder="https://example.com"
+)
+crawl_website = st.checkbox(
+    "Crawl entire website(s)",
+    help="Enable this to extract content from all pages of the specified website(s)",
+)
+
+if st.button("Process and Index Documents"):
+    if not st.session_state.get("openai_api_key"):
+        st.error("Please enter your OpenAI API key first.")
+    else:
+        st.session_state.client, st.session_state.collection_name = (
+            process_and_index_documents(
+                uploaded_files, web_urls, crawl_website=crawl_website
+            )
+        )
+
+if st.session_state.client and st.session_state.collection_name:
+    question = st.text_input("Ask a question about the documents:")
+    if st.button("Get Answer"):
+        answer_question(
+            question, st.session_state.client, st.session_state.collection_name
+        )
+elif uploaded_files or web_urls:
+    st.warning("Please process and index the documents first.")
+else:
+    st.info("Upload PDFs or provide web URLs to get started.")
