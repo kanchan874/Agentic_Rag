@@ -175,7 +175,7 @@ def process_and_index_documents(
 
     client = QdrantClient("http://localhost:6333")
     collection_name = "agent_rag_index"
-    VECTOR_SIZE = 384  # Dimension of BAAI/bge-small-en-v1.5
+    VECTOR_SIZE = 384
 
     with st.spinner("Indexing vectors in Qdrant..."):
         try:
@@ -208,7 +208,97 @@ def process_and_index_documents(
     return client, collection_name
 
 
-def answer_question(question, client, collection_name, model="gemini/gemini-1.5-flash", api_key=None, top_k=3):
+def get_available_gemini_models(api_key: str):
+    """Detect available models for the provided Gemini API key to avoid 404s."""
+    try:
+        r = requests.get(
+            f"https://generativelanguage.googleapis.com/v1beta/models?key={api_key}",
+            timeout=8,
+        )
+        if r.status_code == 200:
+            models = [
+                m["name"].replace("models/", "")
+                for m in r.json().get("models", [])
+                if "generateContent" in m.get("supportedGenerationMethods", [])
+            ]
+            preferred_order = [
+                "gemini-2.0-flash",
+                "gemini-2.5-flash",
+                "gemini-1.5-flash-latest",
+                "gemini-1.5-flash-002",
+                "gemini-1.5-flash",
+                "gemini-1.5-pro",
+                "gemini-pro",
+            ]
+            for pref in preferred_order:
+                if pref in models:
+                    return pref
+            if models:
+                return models[0]
+    except Exception:
+        pass
+    return "gemini-2.0-flash"
+
+
+def call_llm(messages, provider: str, api_key: str, max_tokens: int = 1000) -> str:
+    """Universal LLM caller that handles Gemini (direct REST API) and OpenAI with fallbacks."""
+    if "Gemini" in provider:
+        target_model = get_available_gemini_models(api_key)
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{target_model}:generateContent?key={api_key}"
+
+        contents = []
+        system_instruction = None
+
+        for msg in messages:
+            if msg["role"] == "system":
+                system_instruction = {"parts": [{"text": msg["content"]}]}
+            elif msg["role"] == "user":
+                contents.append({"role": "user", "parts": [{"text": msg["content"]}]})
+            elif msg["role"] == "assistant":
+                contents.append({"role": "model", "parts": [{"text": msg["content"]}]})
+
+        body = {
+            "contents": contents,
+            "generationConfig": {"maxOutputTokens": max_tokens},
+        }
+        if system_instruction:
+            body["systemInstruction"] = system_instruction
+
+        headers = {"Content-Type": "application/json"}
+        response = requests.post(url, headers=headers, json=body, timeout=30)
+
+        if response.status_code == 200:
+            data = response.json()
+            candidates = data.get("candidates", [])
+            if candidates:
+                parts = candidates[0].get("content", {}).get("parts", [])
+                if parts:
+                    return parts[0].get("text", "")
+            return ""
+        else:
+            # Fallback to LiteLLM if direct API returns unexpected status
+            try:
+                res = completion(
+                    model=f"gemini/{target_model}",
+                    messages=messages,
+                    max_tokens=max_tokens,
+                    api_key=api_key,
+                )
+                return res.choices[0].message.content
+            except Exception:
+                raise Exception(f"Gemini API returned {response.status_code}: {response.text}")
+    else:
+        # OpenAI
+        res = completion(
+            model="gpt-4o-mini",
+            messages=messages,
+            max_tokens=max_tokens,
+            api_key=api_key,
+        )
+        return res.choices[0].message.content
+
+
+def answer_question(question, client, collection_name, provider="Google Gemini (Free)", api_key=None, top_k=3):
     if not question.strip():
         st.warning("Please enter a question.")
         return
@@ -250,8 +340,7 @@ def answer_question(question, client, collection_name, model="gemini/gemini-1.5-
         context = format_docs(results)
 
         try:
-            response = completion(
-                model=model,
+            has_answer = call_llm(
                 messages=[
                     {
                         "content": decision_system_prompt.format(context=context),
@@ -259,15 +348,14 @@ def answer_question(question, client, collection_name, model="gemini/gemini-1.5-
                     },
                     {"content": user_prompt.format(question=question), "role": "user"},
                 ],
-                max_tokens=50,
+                provider=provider,
                 api_key=api_key,
-            )
-            has_answer = response.choices[0].message.content.strip()
+                max_tokens=50,
+            ).strip()
 
             if "1" in has_answer:
                 st.info("Found relevant information in the indexed documents!")
-                response = completion(
-                    model=model,
+                answer = call_llm(
                     messages=[
                         {
                             "content": system_prompt.format(context=context),
@@ -275,17 +363,17 @@ def answer_question(question, client, collection_name, model="gemini/gemini-1.5-
                         },
                         {"content": user_prompt.format(question=question), "role": "user"},
                     ],
-                    max_tokens=1000,
+                    provider=provider,
                     api_key=api_key,
+                    max_tokens=1500,
                 )
-                st.markdown(response.choices[0].message.content)
+                st.markdown(answer)
             else:
                 st.info("No direct answer in indexed documents. Searching online via DuckDuckGo...")
                 results = DDGS().text(question, max_results=5)
                 context = "\n\n".join(doc["body"] for doc in results)
                 st.info("Generating response from online sources...")
-                response = completion(
-                    model=model,
+                answer = call_llm(
                     messages=[
                         {
                             "content": system_prompt.format(context=context),
@@ -293,12 +381,13 @@ def answer_question(question, client, collection_name, model="gemini/gemini-1.5-
                         },
                         {"content": user_prompt.format(question=question), "role": "user"},
                     ],
-                    max_tokens=1000,
+                    provider=provider,
                     api_key=api_key,
+                    max_tokens=1500,
                 )
-                st.markdown(response.choices[0].message.content)
+                st.markdown(answer)
         except Exception as e:
-            st.error(f"Error querying model ({model}): {e}")
+            st.error(f"Error querying model: {e}")
 
 
 st.title("RAG System with PDF and Website Crawling Support")
@@ -322,7 +411,6 @@ with col2:
         )
         if api_key_input:
             st.session_state.gemini_api_key = api_key_input
-        active_model = "gemini/gemini-1.5-flash"
         active_key = st.session_state.get("gemini_api_key", default_gemini)
         st.caption("✨ Tip: Gemini API is 100% Free. Get key at [Google AI Studio](https://aistudio.google.com/app/apikey)")
     else:
@@ -334,7 +422,6 @@ with col2:
         )
         if api_key_input:
             st.session_state.openai_api_key = api_key_input
-        active_model = "gpt-4o-mini"
         active_key = st.session_state.get("openai_api_key", default_openai)
 
 uploaded_files = st.file_uploader(
@@ -367,7 +454,7 @@ if st.session_state.client and st.session_state.collection_name:
                 question,
                 st.session_state.client,
                 st.session_state.collection_name,
-                model=active_model,
+                provider=llm_choice,
                 api_key=active_key,
             )
 elif uploaded_files or web_urls:
