@@ -1,6 +1,3 @@
-# Agentic RAG - Final Integration Stage 133
-# Timestamp: 2026-10-11
-
 import streamlit as st
 import PyPDF2
 import json
