@@ -4,6 +4,7 @@ import json
 import requests
 from typing import Optional
 from langchain_text_splitters import RecursiveCharacterTextSplitter
+import litellm
 from litellm import completion
 from qdrant_client import QdrantClient
 from qdrant_client.models import VectorParams, Distance
@@ -17,10 +18,29 @@ from fastembed import TextEmbedding
 
 load_dotenv()
 
+# Prevent LiteLLM from hanging for 30s on rate limits or sending telemetry
+os.environ["LITELLM_TELEMETRY"] = "False"
+litellm.telemetry = False
+litellm.num_retries = 0
+
 if "client" not in st.session_state:
     st.session_state.client = None
 if "collection_name" not in st.session_state:
     st.session_state.collection_name = None
+
+# Auto-reconnect to existing indexed Qdrant collection on page reload
+if st.session_state.client is None or st.session_state.collection_name is None:
+    try:
+        init_client = QdrantClient("http://localhost:6333")
+        existing_cols = [c.name for c in init_client.get_collections().collections]
+        if "agent_rag_index" in existing_cols:
+            col_info = init_client.get_collection("agent_rag_index")
+            if col_info.points_count > 0:
+                st.session_state.client = init_client
+                st.session_state.collection_name = "agent_rag_index"
+                st.session_state.indexed_count = col_info.points_count
+    except Exception:
+        pass
 
 DEFAULT_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
@@ -208,12 +228,13 @@ def process_and_index_documents(
     return client, collection_name
 
 
+@st.cache_data(ttl=3600, show_spinner=False)
 def get_available_gemini_models(api_key: str):
-    """Detect available models for the provided Gemini API key to avoid 404s."""
+    """Detect available models for the provided Gemini API key once and cache."""
     try:
         r = requests.get(
             f"https://generativelanguage.googleapis.com/v1beta/models?key={api_key}",
-            timeout=8,
+            timeout=3,
         )
         if r.status_code == 200:
             models = [
@@ -222,12 +243,11 @@ def get_available_gemini_models(api_key: str):
                 if "generateContent" in m.get("supportedGenerationMethods", [])
             ]
             preferred_order = [
-                "gemini-2.0-flash",
+                "gemini-3.8-flash",
                 "gemini-2.5-flash",
-                "gemini-1.5-flash-latest",
-                "gemini-1.5-flash-002",
+                "gemini-2.0-flash",
                 "gemini-1.5-flash",
-                "gemini-1.5-pro",
+                "gemini-1.5-flash-latest",
                 "gemini-pro",
             ]
             for pref in preferred_order:
@@ -237,11 +257,108 @@ def get_available_gemini_models(api_key: str):
                 return models[0]
     except Exception:
         pass
-    return "gemini-2.0-flash"
+    return "gemini-3.8-flash"
+
+
+def safe_ddg_search(query: str, max_results: int = 4):
+    """Fast, safe DuckDuckGo search that does not hang or crash on ratelimits."""
+    try:
+        ddgs = DDGS(timeout=4)
+        return list(ddgs.text(query, max_results=max_results))
+    except Exception as e:
+        print(f"DuckDuckGo search notice: {e}")
+        return []
+
+
+def stream_llm(messages, provider: str, api_key: str, max_tokens: int = 1500):
+    """Streams response tokens from Gemini or OpenAI for instant UI feedback."""
+    if "Gemini" in provider:
+        target_model = get_available_gemini_models(api_key)
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{target_model}:streamGenerateContent?key={api_key}&alt=sse"
+
+        contents = []
+        system_instruction = None
+
+        for msg in messages:
+            if msg["role"] == "system":
+                system_instruction = {"parts": [{"text": msg["content"]}]}
+            elif msg["role"] == "user":
+                contents.append({"role": "user", "parts": [{"text": msg["content"]}]})
+            elif msg["role"] == "assistant":
+                contents.append({"role": "model", "parts": [{"text": msg["content"]}]})
+
+        body = {
+            "contents": contents,
+            "generationConfig": {"maxOutputTokens": max_tokens},
+        }
+        if system_instruction:
+            body["systemInstruction"] = system_instruction
+
+        headers = {"Content-Type": "application/json"}
+        try:
+            with requests.post(url, headers=headers, json=body, stream=True, timeout=25) as resp:
+                if resp.status_code == 200:
+                    for line in resp.iter_lines(decode_unicode=True):
+                        if line and line.startswith("data: "):
+                            raw_json = line[6:].strip()
+                            if raw_json:
+                                data = json.loads(raw_json)
+                                candidates = data.get("candidates", [])
+                                if candidates:
+                                    parts = candidates[0].get("content", {}).get("parts", [])
+                                    for part in parts:
+                                        chunk_text = part.get("text", "")
+                                        if chunk_text:
+                                            yield chunk_text
+                    return
+                elif resp.status_code == 400:
+                    err_msg = resp.json().get("error", {}).get("message", resp.text)
+                    raise Exception(f"Gemini API Error (400): {err_msg}")
+                elif resp.status_code in (401, 403):
+                    try:
+                        err_msg = resp.json().get("error", {}).get("message", resp.text)
+                    except Exception:
+                        err_msg = resp.text
+                    raise Exception(f"Gemini API Error ({resp.status_code}): {err_msg}")
+                else:
+                    # Fallback to standard completion
+                    yield call_llm(messages, provider, api_key, max_tokens)
+                    return
+        except Exception as e:
+            if "Gemini API Error" in str(e):
+                raise e
+            # Fallback to direct call_llm if SSE fails
+            yield call_llm(messages, provider, api_key, max_tokens)
+            return
+
+    else:
+        # OpenAI
+        try:
+            response = completion(
+                model="gpt-4o-mini",
+                messages=messages,
+                max_tokens=max_tokens,
+                api_key=api_key,
+                stream=True,
+                num_retries=0,
+            )
+            for chunk in response:
+                content = chunk.choices[0].delta.content or ""
+                if content:
+                    yield content
+        except Exception as e:
+            err_str = str(e)
+            if "insufficient_quota" in err_str or "credit_balance_exhausted" in err_str:
+                raise Exception(
+                    "OpenAI Quota Exhausted: Your OpenAI account has 0 credits remaining. "
+                    "Please add billing credits at platform.openai.com/settings/organization/billing "
+                    "or switch to 'Google Gemini (Free)' in the dropdown above."
+                )
+            raise e
 
 
 def call_llm(messages, provider: str, api_key: str, max_tokens: int = 1000) -> str:
-    """Universal LLM caller that handles Gemini (direct REST API) and OpenAI with fallbacks."""
+    """Universal non-streaming LLM caller with immediate error handling."""
     if "Gemini" in provider:
         target_model = get_available_gemini_models(api_key)
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{target_model}:generateContent?key={api_key}"
@@ -265,7 +382,7 @@ def call_llm(messages, provider: str, api_key: str, max_tokens: int = 1000) -> s
             body["systemInstruction"] = system_instruction
 
         headers = {"Content-Type": "application/json"}
-        response = requests.post(url, headers=headers, json=body, timeout=30)
+        response = requests.post(url, headers=headers, json=body, timeout=25)
 
         if response.status_code == 200:
             data = response.json()
@@ -276,29 +393,40 @@ def call_llm(messages, provider: str, api_key: str, max_tokens: int = 1000) -> s
                     return parts[0].get("text", "")
             return ""
         else:
-            # Fallback to LiteLLM if direct API returns unexpected status
             try:
                 res = completion(
                     model=f"gemini/{target_model}",
                     messages=messages,
                     max_tokens=max_tokens,
                     api_key=api_key,
+                    num_retries=0,
                 )
                 return res.choices[0].message.content
             except Exception:
                 raise Exception(f"Gemini API returned {response.status_code}: {response.text}")
     else:
         # OpenAI
-        res = completion(
-            model="gpt-4o-mini",
-            messages=messages,
-            max_tokens=max_tokens,
-            api_key=api_key,
-        )
-        return res.choices[0].message.content
+        try:
+            res = completion(
+                model="gpt-4o-mini",
+                messages=messages,
+                max_tokens=max_tokens,
+                api_key=api_key,
+                num_retries=0,
+            )
+            return res.choices[0].message.content
+        except Exception as e:
+            err_str = str(e)
+            if "insufficient_quota" in err_str or "credit_balance_exhausted" in err_str:
+                raise Exception(
+                    "OpenAI Quota Exhausted: Your OpenAI account has 0 credits remaining. "
+                    "Please add billing credits at platform.openai.com/settings/organization/billing "
+                    "or switch to 'Google Gemini (Free)' in the dropdown above."
+                )
+            raise e
 
 
-def answer_question(question, client, collection_name, provider="Google Gemini (Free)", api_key=None, top_k=3):
+def answer_question(question, client, collection_name, provider="Google Gemini (Free)", api_key=None, top_k=4):
     if not question.strip():
         st.warning("Please enter a question.")
         return
@@ -310,87 +438,128 @@ def answer_question(question, client, collection_name, provider="Google Gemini (
         )
 
     def format_docs(docs):
-        return "\n\n".join(doc.payload["content"] for doc in docs)
+        return "\n\n".join(
+            f"[Source: {doc.payload.get('metadata', {}).get('filename') or doc.payload.get('metadata', {}).get('url', 'Document')}]\n{doc.payload.get('content', '')}"
+            for doc in docs
+        )
 
-    decision_system_prompt = """You are an agent deciding whether a given context answers a user question.
-    Return 1 if the context directly contains enough information to answer the question.
-    If not return 0.
-    Context: {context}
-    """
-
-    system_prompt = """You are an expert in answering questions. Provide answers based **exclusively** on the given context. 
-
-        **Rules:**
-        1. If the question cannot be answered using the context, respond only with: "I don't know."
-        2. Do **not** infer, assume, or add information not explicitly provided in the context.
-        3. Your answers must be:
-        - **Concise**: Avoid unnecessary details.
-        - **Informative**: Focus on actionable and precise responses.
-        4. Format your response in **Markdown**.
-
-        **Context:** {context}
-    """
-
-    user_prompt = """
-    Question: {question}
-    Answer:"""
-
-    with st.spinner("Searching for relevant information..."):
+    t_start = time.time()
+    with st.spinner("⚡ Searching indexed documents..."):
         results = search(question)
-        context = format_docs(results)
+    t_search = time.time() - t_start
 
+    top_score = results[0].score if results else 0.0
+    context = format_docs(results) if results else ""
+
+    # Smart High-Confidence Threshold:
+    # If top chunk has cosine similarity >= 0.40, the indexed context directly matches the topic!
+    # Generates in 1 fast pass without a wasteful extra roundtrip.
+    has_high_relevance = top_score >= 0.40
+
+    if has_high_relevance:
+        source_names = list(set(
+            doc.payload.get("metadata", {}).get("filename") or doc.payload.get("metadata", {}).get("url") or "Document"
+            for doc in results
+        ))
+        st.success(f"🎯 Found relevant content in: **{', '.join(source_names)}** *(Top Score: {top_score:.1%}, Retrieved in {t_search:.2f}s)*")
+        
+        with st.expander("📄 View Retrieved Document Context"):
+            for i, doc in enumerate(results):
+                st.markdown(f"**Chunk {i+1}** (Score: `{doc.score:.2f}` | Source: `{doc.payload.get('metadata', {}).get('filename', doc.payload.get('metadata', {}).get('url', 'Unknown'))}`):")
+                st.caption(doc.payload.get("content", ""))
+
+        system_prompt = f"""You are an expert AI assistant answering questions based on indexed documents.
+Provide an accurate, concise, and structured answer based **exclusively** on the given context.
+
+Rules:
+1. If the question cannot be answered using the context, state: "The uploaded documents do not contain enough information to fully answer this." and summarize whatever related points are mentioned.
+2. Format your response in clean Markdown with clear headings or bullet points.
+
+Context:
+{context}
+"""
+        user_prompt = f"Question: {question}\nAnswer:"
+
+        st.subheader("💡 Answer:")
+        t_gen_start = time.time()
         try:
-            has_answer = call_llm(
+            stream = stream_llm(
                 messages=[
-                    {
-                        "content": decision_system_prompt.format(context=context),
-                        "role": "system",
-                    },
-                    {"content": user_prompt.format(question=question), "role": "user"},
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
                 ],
                 provider=provider,
                 api_key=api_key,
-                max_tokens=50,
-            ).strip()
+                max_tokens=1500,
+            )
+            st.write_stream(stream)
+            t_gen = time.time() - t_gen_start
+            st.caption(f"⚡ Search: {t_search:.2f}s | Generation: {t_gen:.2f}s | Total: {time.time()-t_start:.2f}s")
+        except Exception as e:
+            st.error(f"Error querying model: {e}")
 
-            if "1" in has_answer:
-                st.info("Found relevant information in the indexed documents!")
-                answer = call_llm(
-                    messages=[
-                        {
-                            "content": system_prompt.format(context=context),
-                            "role": "system",
-                        },
-                        {"content": user_prompt.format(question=question), "role": "user"},
-                    ],
-                    provider=provider,
-                    api_key=api_key,
-                    max_tokens=1500,
-                )
-                st.markdown(answer)
-            else:
-                st.info("No direct answer in indexed documents. Searching online via DuckDuckGo...")
-                results = DDGS().text(question, max_results=5)
-                context = "\n\n".join(doc["body"] for doc in results)
-                st.info("Generating response from online sources...")
-                answer = call_llm(
-                    messages=[
-                        {
-                            "content": system_prompt.format(context=context),
-                            "role": "system",
-                        },
-                        {"content": user_prompt.format(question=question), "role": "user"},
-                    ],
-                    provider=provider,
-                    api_key=api_key,
-                    max_tokens=1500,
-                )
-                st.markdown(answer)
+    else:
+        # Out of database context -> Fallback to Web Search
+        st.info(f"🔍 Low similarity in indexed documents (Top score: {top_score:.1%}). Searching web sources...")
+        t_ddg_start = time.time()
+        web_results = safe_ddg_search(question, max_results=4)
+        t_ddg = time.time() - t_ddg_start
+
+        if web_results:
+            web_context = "\n\n".join(
+                f"[Title: {r.get('title', '')} | URL: {r.get('href', '')}]\n{r.get('body', '')}"
+                for r in web_results
+            )
+            st.markdown(f"🌐 Found **{len(web_results)}** web results (Search took {t_ddg:.2f}s)")
+            with st.expander("🌐 View Web Sources"):
+                for r in web_results:
+                    st.markdown(f"- [{r.get('title', 'Link')}]({r.get('href', '#')}): {r.get('body', '')[:160]}...")
+            effective_context = web_context
+            source_desc = "DuckDuckGo Web Search"
+        else:
+            st.warning("⚠️ Web search provider rate-limited. Falling back to model knowledge with best available context.")
+            effective_context = context
+            source_desc = "Document matches & General Knowledge"
+
+        web_system_prompt = f"""You are an expert AI assistant. Provide a clear, helpful, and informative answer to the question using the context below.
+
+Context ({source_desc}):
+{effective_context}
+
+Format response in clean Markdown.
+"""
+        user_prompt = f"Question: {question}\nAnswer:"
+
+        st.subheader("💡 Answer:")
+        t_gen_start = time.time()
+        try:
+            stream = stream_llm(
+                messages=[
+                    {"role": "system", "content": web_system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                provider=provider,
+                api_key=api_key,
+                max_tokens=1500,
+            )
+            st.write_stream(stream)
+            t_gen = time.time() - t_gen_start
+            st.caption(f"⚡ Search: {t_search + t_ddg:.2f}s | Generation: {t_gen:.2f}s | Total: {time.time()-t_start:.2f}s")
         except Exception as e:
             st.error(f"Error querying model: {e}")
 
 
-st.title("RAG System with PDF and Website Crawling Support")
+st.title("⚡ Agentic RAG System")
+st.caption("High-Performance RAG with PDF & Website Crawling, Local Embeddings, and Real-Time Streaming")
+
+# Display status of vector database and indexed documents
+if st.session_state.client and st.session_state.collection_name:
+    try:
+        current_info = st.session_state.client.get_collection(st.session_state.collection_name)
+        count = current_info.points_count
+        st.success(f"🟢 **Qdrant Vector Database Connected**: `{st.session_state.collection_name}` has **{count} chunks** ready to query.")
+    except Exception:
+        pass
 
 col1, col2 = st.columns([1, 2])
 with col1:
@@ -412,7 +581,7 @@ with col2:
         if api_key_input:
             st.session_state.gemini_api_key = api_key_input
         active_key = st.session_state.get("gemini_api_key", default_gemini)
-        st.caption("✨ Tip: Gemini API is 100% Free. Get key at [Google AI Studio](https://aistudio.google.com/app/apikey)")
+        st.caption("✨ **Gemini API is 100% Free** (No credit card required). Get key at [Google AI Studio](https://aistudio.google.com/app/apikey)")
     else:
         default_openai = os.getenv("OPENAI_API_KEY", "")
         api_key_input = st.text_input(
@@ -445,8 +614,10 @@ if st.button("Process and Index Documents"):
     )
 
 if st.session_state.client and st.session_state.collection_name:
-    question = st.text_input("Ask a question about the documents:")
-    if st.button("Get Answer"):
+    st.markdown("---")
+    st.subheader("💬 Ask Your Question")
+    question = st.text_input("Enter your question about the documents:", placeholder="e.g. What is the proposed solution?")
+    if st.button("Get Answer", type="primary"):
         if not active_key:
             st.error(f"Please enter your {llm_choice} API key above to generate the answer.")
         else:
