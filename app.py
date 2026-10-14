@@ -16,17 +16,30 @@ import time
 from dotenv import load_dotenv
 from fastembed import TextEmbedding
 
+# Page configuration - must be the first Streamlit command
+st.set_page_config(
+    page_title="Cognitive RAG Workspace",
+    page_icon="◈",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
+
 load_dotenv()
 
-# Prevent LiteLLM from hanging for 30s on rate limits or sending telemetry
+# Prevent LiteLLM telemetry and retries hanging
 os.environ["LITELLM_TELEMETRY"] = "False"
 litellm.telemetry = False
 litellm.num_retries = 0
 
+# Session State Initialization
 if "client" not in st.session_state:
     st.session_state.client = None
 if "collection_name" not in st.session_state:
     st.session_state.collection_name = None
+if "indexed_count" not in st.session_state:
+    st.session_state.indexed_count = 0
+if "last_query" not in st.session_state:
+    st.session_state.last_query = ""
 
 # Auto-reconnect to existing indexed Qdrant collection on page reload
 if st.session_state.client is None or st.session_state.collection_name is None:
@@ -41,6 +54,123 @@ if st.session_state.client is None or st.session_state.collection_name is None:
                 st.session_state.indexed_count = col_info.points_count
     except Exception:
         pass
+
+# Refined Executive UI Styling
+st.markdown(
+    """
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700&display=swap');
+        
+        html, body, [class*="css"] {
+            font-family: 'Plus Jakarta Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+        }
+
+        /* Top Header Styling */
+        .workspace-header {
+            margin-bottom: 1.25rem;
+            padding-bottom: 0.85rem;
+            border-bottom: 1px solid rgba(226, 232, 240, 0.2);
+        }
+        .workspace-title {
+            font-size: 1.55rem;
+            font-weight: 700;
+            letter-spacing: -0.025em;
+            margin: 0;
+            color: inherit;
+        }
+        .workspace-subtitle {
+            font-size: 0.88rem;
+            color: #64748b;
+            margin-top: 0.2rem;
+        }
+
+        /* Status Pills */
+        .status-pill-active {
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            padding: 3px 10px;
+            border-radius: 9999px;
+            font-size: 0.78rem;
+            font-weight: 500;
+            background-color: rgba(16, 185, 129, 0.1);
+            color: #10b981;
+            border: 1px solid rgba(16, 185, 129, 0.25);
+        }
+        .status-pill-neutral {
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            padding: 3px 10px;
+            border-radius: 9999px;
+            font-size: 0.78rem;
+            font-weight: 500;
+            background-color: rgba(148, 163, 184, 0.1);
+            color: #94a3b8;
+            border: 1px solid rgba(148, 163, 184, 0.25);
+        }
+
+        /* Metric Chips */
+        .metric-chip {
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+            padding: 6px 12px;
+            border-radius: 6px;
+            font-size: 0.8rem;
+            background: rgba(241, 245, 249, 0.05);
+            border: 1px solid rgba(226, 232, 240, 0.15);
+            margin-right: 8px;
+            margin-bottom: 8px;
+        }
+
+        /* Source Citation Box */
+        .source-card {
+            padding: 10px 14px;
+            border-radius: 6px;
+            border-left: 3px solid #3b82f6;
+            background: rgba(241, 245, 249, 0.03);
+            border-top: 1px solid rgba(226, 232, 240, 0.08);
+            border-right: 1px solid rgba(226, 232, 240, 0.08);
+            border-bottom: 1px solid rgba(226, 232, 240, 0.08);
+            margin-bottom: 8px;
+            font-size: 0.86rem;
+        }
+
+        /* Clean tabs */
+        .stTabs [data-baseweb="tab-list"] {
+            gap: 12px;
+            border-bottom: 1px solid rgba(226, 232, 240, 0.15);
+        }
+        .stTabs [data-baseweb="tab"] {
+            padding: 8px 16px;
+            border-radius: 6px 6px 0 0;
+            font-weight: 500;
+            font-size: 0.88rem;
+        }
+
+        /* Sidebar Clean Polish */
+        [data-testid="stSidebar"] {
+            border-right: 1px solid rgba(226, 232, 240, 0.12);
+        }
+        .sidebar-section-header {
+            font-size: 0.76rem;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 0.06em;
+            color: #64748b;
+            margin-top: 1.25rem;
+            margin-bottom: 0.5rem;
+        }
+
+        /* Code block styling */
+        pre {
+            border-radius: 6px !important;
+        }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
 
 DEFAULT_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
@@ -62,7 +192,7 @@ def get_all_urls(base_url):
                         parsed_url.scheme + "://" + parsed_url.netloc + parsed_url.path
                     )
     except Exception as e:
-        st.error(f"An error occurred while crawling {base_url}: {e}")
+        st.error(f"Error crawling {base_url}: {e}")
     return urls
 
 
@@ -71,34 +201,22 @@ def extract_text_from_url(url):
         response = requests.get(url, headers=DEFAULT_HEADERS, timeout=15)
         if response.status_code == 200:
             soup = BeautifulSoup(response.text, "html.parser")
-
             for script in soup(["script", "style"]):
                 script.decompose()
-
             text = soup.get_text()
-
             lines = (line.strip() for line in text.splitlines())
-
             chunks = (phrase.strip() for line in lines for phrase in line.split("  "))
-
-            text = " ".join(chunk for chunk in chunks if chunk)
-
-            return text
+            return " ".join(chunk for chunk in chunks if chunk)
         else:
-            st.warning(
-                f"Failed to fetch content from {url}: Status code {response.status_code}"
-            )
             return None
-    except Exception as e:
-        st.warning(f"Error extracting text from {url}: {e}")
+    except Exception:
         return None
 
 
 def fetch_url_content(url: str) -> Optional[str]:
     try:
         return extract_text_from_url(url)
-    except Exception as e:
-        st.error(f"Error: Failed to fetch URL {url}. Exception: {e}")
+    except Exception:
         return None
 
 
@@ -125,7 +243,7 @@ def process_uploaded_pdfs(uploaded_files):
                 content += page.extract_text() or ""
             pdf_list.append({"content": content, "filename": uploaded_file.name})
         except Exception as e:
-            st.error(f"Error processing {uploaded_file.name}: {str(e)}")
+            st.error(f"Error reading {uploaded_file.name}: {e}")
     return pdf_list
 
 
@@ -159,19 +277,19 @@ def process_and_index_documents(
             progress_text = st.empty()
 
             for i, base_url in enumerate(urls):
-                progress_text.text(f"Crawling website: {base_url}")
+                progress_text.text(f"Scanning target: {base_url}")
                 site_urls = get_all_urls(base_url)
                 all_urls.update(site_urls)
                 progress_bar.progress((i + 1) / len(urls))
 
             urls = list(all_urls)
-            progress_text.text(f"Found {len(urls)} unique URLs")
+            progress_text.text(f"Discovered {len(urls)} target URLs")
 
         progress_bar = st.progress(0)
         progress_text = st.empty()
 
         for i, url in enumerate(urls):
-            progress_text.text(f"Processing URL {i+1}/{len(urls)}: {url}")
+            progress_text.text(f"Ingesting URL {i+1}/{len(urls)}: {url}")
             content = fetch_url_content(url)
 
             if content:
@@ -181,23 +299,23 @@ def process_and_index_documents(
                     doc_metadata.append({"url": url, "source": "web_content"})
 
             progress_bar.progress((i + 1) / len(urls))
-            time.sleep(0.1)
+            time.sleep(0.05)
 
         progress_text.empty()
         progress_bar.empty()
 
     if not all_chunks:
-        st.error("No content to process. Please provide valid PDFs or web URLs.")
+        st.error("No valid content found to index.")
         return None, None
 
-    with st.spinner("Generating local embeddings (100% Free via FastEmbed)..."):
+    with st.spinner("Generating dense vectors with FastEmbed..."):
         embeddings = get_embeddings(all_chunks)
 
     client = QdrantClient("http://localhost:6333")
     collection_name = "agent_rag_index"
     VECTOR_SIZE = 384
 
-    with st.spinner("Indexing vectors in Qdrant..."):
+    with st.spinner("Writing chunks into Qdrant vector database..."):
         try:
             client.delete_collection(collection_name)
         except Exception:
@@ -222,8 +340,9 @@ def process_and_index_documents(
             batch_size=256,
         )
 
+    st.session_state.indexed_count = len(all_chunks)
     st.success(
-        f"Successfully indexed {len(all_chunks)} chunks from {len(set(m['source'] for m in doc_metadata))} sources in Qdrant!"
+        f"Indexed {len(all_chunks)} chunks across {len(set(m.get('filename') or m.get('url') for m in doc_metadata))} sources."
     )
     return client, collection_name
 
@@ -238,7 +357,6 @@ def get_available_gemini_models(api_key: str):
         "gemini-3.8-flash",
         "gemini-3.5-flash",
         "gemini-3.7-flash",
-        "gemini-3.6-flash",
     ]
     try:
         r = requests.get(
@@ -260,18 +378,72 @@ def get_available_gemini_models(api_key: str):
 
 
 def safe_ddg_search(query: str, max_results: int = 4):
-    """Fast, safe DuckDuckGo search that does not hang or crash on ratelimits."""
+    """Resilient DuckDuckGo search with strict timeout to avoid interface blocking."""
     try:
         ddgs = DDGS(timeout=4)
         return list(ddgs.text(query, max_results=max_results))
-    except Exception as e:
-        print(f"DuckDuckGo search notice: {e}")
+    except Exception:
         return []
 
 
 def stream_llm(messages, provider: str, api_key: str, max_tokens: int = 1500):
-    """Streams response tokens from Gemini or OpenAI for instant UI feedback."""
-    if "Gemini" in provider:
+    """Streams response tokens from Groq, Gemini, or OpenAI."""
+    if "Groq" in provider:
+        groq_models = ["openai/gpt-oss-120b", "openai/gpt-oss-20b", "qwen/qwen3.8-27b"]
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        }
+        for g_model in groq_models:
+            payload = {
+                "model": g_model,
+                "messages": messages,
+                "max_tokens": max_tokens,
+                "stream": True,
+            }
+            try:
+                with requests.post(
+                    "https://api.groq.com/openai/v1/chat/completions",
+                    headers=headers,
+                    json=payload,
+                    stream=True,
+                    timeout=25,
+                ) as resp:
+                    if resp.status_code == 200:
+                        yielded_any = False
+                        for raw_line in resp.iter_lines():
+                            if not raw_line:
+                                continue
+                            line = raw_line.decode("utf-8", errors="replace")
+                            if line.startswith("data: "):
+                                chunk_str = line[6:].strip()
+                                if chunk_str == "[DONE]":
+                                    break
+                                try:
+                                    data = json.loads(chunk_str)
+                                    delta = data["choices"][0]["delta"].get("content", "")
+                                    if delta:
+                                        yield delta
+                                        yielded_any = True
+                                except Exception:
+                                    continue
+                        if yielded_any:
+                            return
+                    elif resp.status_code in (401, 403):
+                        err_msg = resp.json().get("error", {}).get("message", "Invalid Groq API key.")
+                        raise Exception(f"Groq API Error ({resp.status_code}): {err_msg}")
+                    else:
+                        continue
+            except Exception as e:
+                if "Groq API Error" in str(e):
+                    raise e
+                continue
+
+        # Fallback to direct completion if streaming interrupted
+        yield call_llm(messages, provider, api_key, max_tokens)
+        return
+
+    elif "Gemini" in provider:
         candidate_models = get_available_gemini_models(api_key)
         contents = []
         system_instruction = None
@@ -299,8 +471,11 @@ def stream_llm(messages, provider: str, api_key: str, max_tokens: int = 1500):
                 with requests.post(url, headers=headers, json=body, stream=True, timeout=25) as resp:
                     if resp.status_code == 200:
                         yielded_any = False
-                        for line in resp.iter_lines(decode_unicode=True):
-                            if line and line.startswith("data: "):
+                        for raw_line in resp.iter_lines():
+                            if not raw_line:
+                                continue
+                            line = raw_line.decode("utf-8", errors="replace")
+                            if line.startswith("data: "):
                                 raw_json = line[6:].strip()
                                 if raw_json:
                                     data = json.loads(raw_json)
@@ -315,7 +490,6 @@ def stream_llm(messages, provider: str, api_key: str, max_tokens: int = 1500):
                         if yielded_any:
                             return
                     elif resp.status_code in (404, 503):
-                        # High demand spike or model deprecated -> try next candidate
                         continue
                     elif resp.status_code in (401, 403):
                         try:
@@ -331,7 +505,6 @@ def stream_llm(messages, provider: str, api_key: str, max_tokens: int = 1500):
                     raise e
                 continue
 
-        # If streaming attempts failed, fallback to call_llm
         yield call_llm(messages, provider, api_key, max_tokens)
         return
 
@@ -355,15 +528,47 @@ def stream_llm(messages, provider: str, api_key: str, max_tokens: int = 1500):
             if "insufficient_quota" in err_str or "credit_balance_exhausted" in err_str:
                 raise Exception(
                     "OpenAI Quota Exhausted: Your OpenAI account has 0 credits remaining. "
-                    "Please add billing credits at platform.openai.com/settings/organization/billing "
-                    "or switch to 'Google Gemini (Free)' in the dropdown above."
+                    "Switch to 'Groq (Ultra-Fast)' or 'Google Gemini (Free)' in the sidebar."
                 )
             raise e
 
 
 def call_llm(messages, provider: str, api_key: str, max_tokens: int = 1000) -> str:
-    """Universal non-streaming LLM caller with candidate fallback and error handling."""
-    if "Gemini" in provider:
+    """Non-streaming fallback caller."""
+    if "Groq" in provider:
+        groq_models = ["openai/gpt-oss-120b", "openai/gpt-oss-20b", "qwen/qwen3.8-27b"]
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        }
+        for g_model in groq_models:
+            payload = {
+                "model": g_model,
+                "messages": messages,
+                "max_tokens": max_tokens,
+            }
+            try:
+                r = requests.post(
+                    "https://api.groq.com/openai/v1/chat/completions",
+                    headers=headers,
+                    json=payload,
+                    timeout=25,
+                )
+                if r.status_code == 200:
+                    data = r.json()
+                    choices = data.get("choices", [])
+                    if choices:
+                        return choices[0].get("message", {}).get("content", "")
+                elif r.status_code in (401, 403):
+                    err_msg = r.json().get("error", {}).get("message", "Invalid Groq API key.")
+                    raise Exception(f"Groq API Error ({r.status_code}): {err_msg}")
+            except Exception as e:
+                if "Groq API Error" in str(e):
+                    raise e
+                continue
+        raise Exception("Groq inference failed on all candidate models.")
+
+    elif "Gemini" in provider:
         candidate_models = get_available_gemini_models(api_key)
         contents = []
         system_instruction = None
@@ -412,6 +617,7 @@ def call_llm(messages, provider: str, api_key: str, max_tokens: int = 1000) -> s
                 continue
 
         raise Exception(f"Gemini API could not complete request: {last_resp_text}")
+
     else:
         # OpenAI
         try:
@@ -428,15 +634,22 @@ def call_llm(messages, provider: str, api_key: str, max_tokens: int = 1000) -> s
             if "insufficient_quota" in err_str or "credit_balance_exhausted" in err_str:
                 raise Exception(
                     "OpenAI Quota Exhausted: Your OpenAI account has 0 credits remaining. "
-                    "Please add billing credits at platform.openai.com/settings/organization/billing "
-                    "or switch to 'Google Gemini (Free)' in the dropdown above."
+                    "Switch to 'Groq (Ultra-Fast)' or 'Google Gemini (Free)' in the sidebar."
                 )
             raise e
 
 
-def answer_question(question, client, collection_name, provider="Google Gemini (Free)", api_key=None, top_k=4):
+def answer_question(
+    question,
+    client,
+    collection_name,
+    provider="Groq (Ultra-Fast)",
+    api_key=None,
+    top_k=4,
+    enable_web_fallback=True,
+):
     if not question.strip():
-        st.warning("Please enter a question.")
+        st.warning("Please provide a question.")
         return
 
     def search(text: str):
@@ -452,43 +665,67 @@ def answer_question(question, client, collection_name, provider="Google Gemini (
         )
 
     t_start = time.time()
-    with st.spinner("⚡ Searching indexed documents..."):
+    with st.spinner("Executing dense vector retrieval..."):
         results = search(question)
     t_search = time.time() - t_start
 
     top_score = results[0].score if results else 0.0
     context = format_docs(results) if results else ""
 
-    # Smart High-Confidence Threshold:
-    # If top chunk has cosine similarity >= 0.40, the indexed context directly matches the topic!
-    # Generates in 1 fast pass without a wasteful extra roundtrip.
+    # Confidence Threshold for direct context matching
     has_high_relevance = top_score >= 0.40
 
     if has_high_relevance:
-        source_names = list(set(
-            doc.payload.get("metadata", {}).get("filename") or doc.payload.get("metadata", {}).get("url") or "Document"
-            for doc in results
-        ))
-        st.success(f"🎯 Found relevant content in: **{', '.join(source_names)}** *(Top Score: {top_score:.1%}, Retrieved in {t_search:.2f}s)*")
-        
-        with st.expander("📄 View Retrieved Document Context"):
+        source_names = list(
+            set(
+                doc.payload.get("metadata", {}).get("filename")
+                or doc.payload.get("metadata", {}).get("url")
+                or "Document"
+                for doc in results
+            )
+        )
+
+        # Performance and Match Summary Chips
+        st.markdown(
+            f"""
+            <div style="margin-bottom: 1rem;">
+                <span class="metric-chip"><strong>Confidence</strong>: {top_score:.1%}</span>
+                <span class="metric-chip"><strong>Retrieval Latency</strong>: {t_search:.3f}s</span>
+                <span class="metric-chip"><strong>Sources</strong>: {', '.join(source_names)}</span>
+                <span class="metric-chip"><strong>Provider</strong>: {provider.split('(')[0].strip()}</span>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+        with st.expander("Attributed Context Chunks", expanded=False):
             for i, doc in enumerate(results):
-                st.markdown(f"**Chunk {i+1}** (Score: `{doc.score:.2f}` | Source: `{doc.payload.get('metadata', {}).get('filename', doc.payload.get('metadata', {}).get('url', 'Unknown'))}`):")
-                st.caption(doc.payload.get("content", ""))
+                src = doc.payload.get("metadata", {}).get(
+                    "filename", doc.payload.get("metadata", {}).get("url", "Context")
+                )
+                st.markdown(
+                    f"""
+                    <div class="source-card">
+                        <strong>Chunk {i+1}</strong> &bull; Score: <code>{doc.score:.2f}</code> &bull; Source: <code>{src}</code><br/>
+                        <span style="color: #64748b;">{doc.payload.get("content", "")}</span>
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
 
-        system_prompt = f"""You are an expert AI assistant answering questions based on indexed documents.
-Provide an accurate, concise, and structured answer based **exclusively** on the given context.
-
-Rules:
-1. If the question cannot be answered using the context, state: "The uploaded documents do not contain enough information to fully answer this." and summarize whatever related points are mentioned.
-2. Format your response in clean Markdown with clear headings or bullet points.
+        system_prompt = f"""You are an executive enterprise assistant providing grounded answers based on indexed organizational documents.
+Answer the question accurately, concisely, and cleanly based on the provided context.
 
 Context:
 {context}
+
+Formatting Rules:
+- Structure your response using clear markdown paragraphs and bullet points.
+- If specific figures, platforms, or dates are mentioned, highlight them accurately.
 """
         user_prompt = f"Question: {question}\nAnswer:"
 
-        st.subheader("💡 Answer:")
+        st.markdown("### Synthesized Response")
         t_gen_start = time.time()
         try:
             stream = stream_llm(
@@ -502,141 +739,291 @@ Context:
             )
             st.write_stream(stream)
             t_gen = time.time() - t_gen_start
-            st.caption(f"⚡ Search: {t_search:.2f}s | Generation: {t_gen:.2f}s | Total: {time.time()-t_start:.2f}s")
+            st.caption(
+                f"Generation completed in {t_gen:.2f}s (Total roundtrip: {time.time()-t_start:.2f}s)"
+            )
         except Exception as e:
-            st.error(f"Error querying model: {e}")
+            st.error(f"Inference Error: {e}")
 
     else:
-        # Out of database context -> Fallback to Web Search
-        st.info(f"🔍 Low similarity in indexed documents (Top score: {top_score:.1%}). Searching web sources...")
-        t_ddg_start = time.time()
-        web_results = safe_ddg_search(question, max_results=4)
-        t_ddg = time.time() - t_ddg_start
-
-        if web_results:
-            web_context = "\n\n".join(
-                f"[Title: {r.get('title', '')} | URL: {r.get('href', '')}]\n{r.get('body', '')}"
-                for r in web_results
+        # Document similarity below threshold -> Web fallback
+        if enable_web_fallback:
+            st.info(
+                f"Internal relevance below threshold ({top_score:.1%}). Broadening search to external web sources..."
             )
-            st.markdown(f"🌐 Found **{len(web_results)}** web results (Search took {t_ddg:.2f}s)")
-            with st.expander("🌐 View Web Sources"):
-                for r in web_results:
-                    st.markdown(f"- [{r.get('title', 'Link')}]({r.get('href', '#')}): {r.get('body', '')[:160]}...")
-            effective_context = web_context
-            source_desc = "DuckDuckGo Web Search"
-        else:
-            st.warning("⚠️ Web search provider rate-limited. Falling back to model knowledge with best available context.")
-            effective_context = context
-            source_desc = "Document matches & General Knowledge"
+            t_ddg_start = time.time()
+            web_results = safe_ddg_search(question, max_results=4)
+            t_ddg = time.time() - t_ddg_start
 
-        web_system_prompt = f"""You are an expert AI assistant. Provide a clear, helpful, and informative answer to the question using the context below.
+            if web_results:
+                web_context = "\n\n".join(
+                    f"[Title: {r.get('title', '')} | URL: {r.get('href', '')}]\n{r.get('body', '')}"
+                    for r in web_results
+                )
+                st.markdown(
+                    f"""
+                    <div style="margin-bottom: 0.75rem;">
+                        <span class="metric-chip"><strong>Web Retrieval</strong>: {t_ddg:.2f}s</span>
+                        <span class="metric-chip"><strong>Results Discovered</strong>: {len(web_results)}</span>
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
+                with st.expander("Web Source Citations", expanded=False):
+                    for r in web_results:
+                        st.markdown(
+                            f"- [{r.get('title', 'Reference')}]({r.get('href', '#')}): {r.get('body', '')[:140]}..."
+                        )
+                effective_context = web_context
+                source_desc = "Live Web Search"
+            else:
+                effective_context = context
+                source_desc = "Best Available Document Match"
+
+            web_system_prompt = f"""You are a professional research assistant. Synthesize a structured, accurate answer to the inquiry using the reference context below.
 
 Context ({source_desc}):
 {effective_context}
-
-Format response in clean Markdown.
 """
-        user_prompt = f"Question: {question}\nAnswer:"
+            user_prompt = f"Question: {question}\nAnswer:"
 
-        st.subheader("💡 Answer:")
-        t_gen_start = time.time()
-        try:
-            stream = stream_llm(
-                messages=[
-                    {"role": "system", "content": web_system_prompt},
-                    {"role": "user", "content": user_prompt},
-                ],
-                provider=provider,
-                api_key=api_key,
-                max_tokens=1500,
+            st.markdown("### Synthesized Response")
+            t_gen_start = time.time()
+            try:
+                stream = stream_llm(
+                    messages=[
+                        {"role": "system", "content": web_system_prompt},
+                        {"role": "user", "content": user_prompt},
+                    ],
+                    provider=provider,
+                    api_key=api_key,
+                    max_tokens=1500,
+                )
+                st.write_stream(stream)
+                t_gen = time.time() - t_gen_start
+                st.caption(
+                    f"Generation completed in {t_gen:.2f}s (Total: {time.time()-t_start:.2f}s)"
+                )
+            except Exception as e:
+                st.error(f"Inference Error: {e}")
+        else:
+            st.warning(
+                f"No direct match found in internal documents (Top score: {top_score:.1%}). External web search is disabled."
             )
-            st.write_stream(stream)
-            t_gen = time.time() - t_gen_start
-            st.caption(f"⚡ Search: {t_search + t_ddg:.2f}s | Generation: {t_gen:.2f}s | Total: {time.time()-t_start:.2f}s")
-        except Exception as e:
-            st.error(f"Error querying model: {e}")
 
 
-st.title("⚡ Agentic RAG System")
-st.caption("High-Performance RAG with PDF & Website Crawling, Local Embeddings, and Real-Time Streaming")
+# ==============================================================================
+# SIDEBAR CONFIGURATION (Executive Panel)
+# ==============================================================================
+with st.sidebar:
+    st.markdown("### System Configuration")
+    st.caption("Retrieval Engine & LLM Settings")
 
-# Display status of vector database and indexed documents
-if st.session_state.client and st.session_state.collection_name:
-    try:
-        current_info = st.session_state.client.get_collection(st.session_state.collection_name)
-        count = current_info.points_count
-        st.success(f"🟢 **Qdrant Vector Database Connected**: `{st.session_state.collection_name}` has **{count} chunks** ready to query.")
-    except Exception:
-        pass
-
-col1, col2 = st.columns([1, 2])
-with col1:
+    st.markdown('<div class="sidebar-section-header">Inference Provider</div>', unsafe_allow_html=True)
     llm_choice = st.selectbox(
-        "Select LLM Provider:",
-        ["Google Gemini (Free)", "OpenAI"],
+        "Select LLM Provider",
+        [
+            "Groq (Ultra-Fast)",
+            "Google Gemini (Free)",
+            "OpenAI (GPT-4o mini)",
+        ],
         index=0,
+        label_visibility="collapsed",
     )
 
-with col2:
-    if llm_choice == "Google Gemini (Free)":
+    if "Groq" in llm_choice:
+        default_groq = os.getenv("GROQ_API_KEY", "")
+        api_key_input = st.text_input(
+            "Groq API Key",
+            value=st.session_state.get("groq_api_key", default_groq),
+            type="password",
+            placeholder="gsk_...",
+            help="High-speed inference powered by Groq LPU",
+        )
+        if api_key_input:
+            st.session_state.groq_api_key = api_key_input
+        active_key = st.session_state.get("groq_api_key", default_groq)
+        if active_key:
+            st.markdown('<span class="status-pill-active">&bull; Groq Connected</span>', unsafe_allow_html=True)
+        else:
+            st.markdown('<span class="status-pill-neutral">Key Required</span>', unsafe_allow_html=True)
+
+    elif "Gemini" in llm_choice:
         default_gemini = os.getenv("GEMINI_API_KEY", "")
         api_key_input = st.text_input(
-            "Enter Google Gemini API Key:",
+            "Google Gemini API Key",
             value=st.session_state.get("gemini_api_key", default_gemini),
             type="password",
-            help="Free key available at https://aistudio.google.com/app/apikey",
+            placeholder="AQ... or AIzaSy...",
+            help="Google AI Studio key",
         )
         if api_key_input:
             st.session_state.gemini_api_key = api_key_input
         active_key = st.session_state.get("gemini_api_key", default_gemini)
-        st.caption("✨ **Gemini API is 100% Free** (No credit card required). Active & Ready.")
+        if active_key:
+            st.markdown('<span class="status-pill-active">&bull; Gemini Connected</span>', unsafe_allow_html=True)
+        else:
+            st.markdown('<span class="status-pill-neutral">Key Required</span>', unsafe_allow_html=True)
+
     else:
         default_openai = os.getenv("OPENAI_API_KEY", "")
         api_key_input = st.text_input(
-            "Enter OpenAI API Key:",
+            "OpenAI API Key",
             value=st.session_state.get("openai_api_key", default_openai),
             type="password",
+            placeholder="sk-...",
         )
         if api_key_input:
             st.session_state.openai_api_key = api_key_input
         active_key = st.session_state.get("openai_api_key", default_openai)
-
-uploaded_files = st.file_uploader(
-    "Upload PDF files:", accept_multiple_files=True, type=["pdf"]
-)
-
-st.subheader("Website Input")
-web_urls = st.text_input(
-    "Enter website URLs (comma-separated):", placeholder="https://example.com"
-)
-crawl_website = st.checkbox(
-    "Crawl entire website(s)",
-    help="Enable this to extract content from all pages of the specified website(s)",
-)
-
-if st.button("Process and Index Documents"):
-    st.session_state.client, st.session_state.collection_name = (
-        process_and_index_documents(
-            uploaded_files, web_urls, crawl_website=crawl_website
-        )
-    )
-
-if st.session_state.client and st.session_state.collection_name:
-    st.markdown("---")
-    st.subheader("💬 Ask Your Question")
-    question = st.text_input("Enter your question about the documents:", placeholder="e.g. What is the proposed solution?")
-    if st.button("Get Answer", type="primary"):
-        if not active_key:
-            st.error(f"Please enter your {llm_choice} API key above to generate the answer.")
+        if active_key:
+            st.markdown('<span class="status-pill-active">&bull; OpenAI Connected</span>', unsafe_allow_html=True)
         else:
+            st.markdown('<span class="status-pill-neutral">Key Required</span>', unsafe_allow_html=True)
+
+    st.markdown('<div class="sidebar-section-header">Knowledge Base Index</div>', unsafe_allow_html=True)
+    if st.session_state.client and st.session_state.collection_name:
+        st.markdown(
+            f"""
+            <div style="font-size: 0.84rem; line-height: 1.6;">
+                <strong>Database:</strong> Qdrant Local<br/>
+                <strong>Collection:</strong> <code>{st.session_state.collection_name}</code><br/>
+                <strong>Indexed Chunks:</strong> <code>{st.session_state.indexed_count}</code><br/>
+                <strong>Embeddings:</strong> FastEmbed BGE-small
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        st.markdown('<span class="status-pill-active" style="margin-top: 6px;">&bull; Vector DB Ready</span>', unsafe_allow_html=True)
+    else:
+        st.markdown(
+            '<div style="font-size: 0.84rem; color: #94a3b8;">No documents currently indexed. Use the Ingestion tab to add sources.</div>',
+            unsafe_allow_html=True,
+        )
+
+    st.markdown('<div class="sidebar-section-header">Search Controls</div>', unsafe_allow_html=True)
+    enable_web_fallback = st.checkbox("Web Search Fallback", value=True, help="Perform external DuckDuckGo search if vector similarity is low.")
+    top_k_chunks = st.slider("Top Chunks Retrieved", min_value=2, max_value=8, value=4)
+
+
+# ==============================================================================
+# MAIN WORKSPACE
+# ==============================================================================
+st.markdown(
+    """
+    <div class="workspace-header">
+        <h1 class="workspace-title">Cognitive RAG Workspace</h1>
+        <div class="workspace-subtitle">Precision document ingestion, dense vector retrieval, and agentic multi-model synthesis.</div>
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
+
+tab_query, tab_ingest = st.tabs(["Search & Synthesis", "Document Ingestion & Index"])
+
+# ------------------------------------------------------------------------------
+# TAB 1: Search & Synthesis
+# ------------------------------------------------------------------------------
+with tab_query:
+    col_input, col_btn = st.columns([5, 1])
+    with col_input:
+        question = st.text_input(
+            "Search Query",
+            placeholder="Ask anything about the indexed documents (e.g. What is the proposed platform architecture?)",
+            label_visibility="collapsed",
+            key="user_query_input",
+        )
+    with col_btn:
+        search_clicked = st.button("Synthesize", type="primary", use_container_width=True)
+
+    # Suggestion Buttons
+    if st.session_state.client and st.session_state.collection_name and not question:
+        st.caption("Suggested queries:")
+        s_c1, s_c2, _ = st.columns([1.5, 1.5, 3])
+        with s_c1:
+            if st.button("Objective of platform", key="btn_sug1"):
+                question = "What is the objective of the proposed solution?"
+                search_clicked = True
+        with s_c2:
+            if st.button("Existing vs Proposed", key="btn_sug2"):
+                question = "Compare existing platform vs proposed solution"
+                search_clicked = True
+
+    if search_clicked:
+        if not st.session_state.client or not st.session_state.collection_name:
+            st.warning("Knowledge base is empty. Please index documents in the 'Document Ingestion' tab first.")
+        elif not active_key:
+            st.error(f"Please configure your {llm_choice.split('(')[0].strip()} API key in the left sidebar.")
+        else:
+            st.session_state.last_query = question
             answer_question(
-                question,
-                st.session_state.client,
-                st.session_state.collection_name,
+                question=question,
+                client=st.session_state.client,
+                collection_name=st.session_state.collection_name,
                 provider=llm_choice,
                 api_key=active_key,
+                top_k=top_k_chunks,
+                enable_web_fallback=enable_web_fallback,
             )
-elif uploaded_files or web_urls:
-    st.warning("Please click 'Process and Index Documents' first.")
-else:
-    st.info("Upload PDFs or provide web URLs to get started.")
+
+# ------------------------------------------------------------------------------
+# TAB 2: Document Ingestion & Indexing
+# ------------------------------------------------------------------------------
+with tab_ingest:
+    st.markdown("#### Ingest Organizational Sources")
+    st.caption("Upload PDF documentation or enter domain URLs to split, embed, and index into the local vector database.")
+
+    col_pdf, col_web = st.columns(2)
+
+    with col_pdf:
+        st.markdown("##### PDF Documents")
+        uploaded_files = st.file_uploader(
+            "Upload PDF files",
+            accept_multiple_files=True,
+            type=["pdf"],
+            label_visibility="collapsed",
+        )
+
+    with col_web:
+        st.markdown("##### Web Ingestion")
+        web_urls = st.text_input(
+            "Enter website URLs (comma-separated)",
+            placeholder="https://example.com, https://docs.example.com",
+            label_visibility="collapsed",
+        )
+        crawl_website = st.checkbox(
+            "Crawl all linked pages on domain",
+            value=False,
+            help="Recursively extract text from all links sharing the root domain.",
+        )
+
+    col_chunk, col_action = st.columns([2, 1])
+    with col_chunk:
+        chunk_size = st.slider("Chunk Size (Characters)", min_value=150, max_value=800, value=300, step=50)
+
+    with col_action:
+        st.markdown("<div style='height: 28px;'></div>", unsafe_allow_html=True)
+        index_clicked = st.button("Process & Re-Index", type="primary", use_container_width=True)
+
+    if index_clicked:
+        if not uploaded_files and not web_urls:
+            st.error("Please provide at least one PDF file or web URL to index.")
+        else:
+            st.session_state.client, st.session_state.collection_name = (
+                process_and_index_documents(
+                    uploaded_files=uploaded_files,
+                    web_urls=web_urls,
+                    chunk_size=chunk_size,
+                    crawl_website=crawl_website,
+                )
+            )
+            st.rerun()
+
+st.markdown(
+    """
+    <div class="subtle-footer">
+        Cognitive RAG Workspace &bull; Local Dense Vectors &bull; Multi-Provider Synthesis
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
