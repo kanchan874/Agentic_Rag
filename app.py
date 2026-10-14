@@ -228,36 +228,35 @@ def process_and_index_documents(
     return client, collection_name
 
 
-@st.cache_data(ttl=3600, show_spinner=False)
+@st.cache_data(ttl=1800, show_spinner=False)
 def get_available_gemini_models(api_key: str):
-    """Detect available models for the provided Gemini API key once and cache."""
+    """Detect available models for the provided Gemini API key in prioritized order."""
+    preferred_order = [
+        "gemini-flash-lite-latest",
+        "gemini-3.5-flash-lite",
+        "gemini-flash-latest",
+        "gemini-3.8-flash",
+        "gemini-3.5-flash",
+        "gemini-3.7-flash",
+        "gemini-3.6-flash",
+    ]
     try:
         r = requests.get(
             f"https://generativelanguage.googleapis.com/v1beta/models?key={api_key}",
-            timeout=3,
+            timeout=4,
         )
         if r.status_code == 200:
-            models = [
+            available = {
                 m["name"].replace("models/", "")
                 for m in r.json().get("models", [])
                 if "generateContent" in m.get("supportedGenerationMethods", [])
-            ]
-            preferred_order = [
-                "gemini-3.8-flash",
-                "gemini-2.5-flash",
-                "gemini-2.0-flash",
-                "gemini-1.5-flash",
-                "gemini-1.5-flash-latest",
-                "gemini-pro",
-            ]
-            for pref in preferred_order:
-                if pref in models:
-                    return pref
-            if models:
-                return models[0]
+            }
+            ordered = [m for m in preferred_order if m in available]
+            if ordered:
+                return ordered
     except Exception:
         pass
-    return "gemini-3.8-flash"
+    return ["gemini-flash-lite-latest", "gemini-3.5-flash-lite", "gemini-flash-latest"]
 
 
 def safe_ddg_search(query: str, max_results: int = 4):
@@ -273,9 +272,7 @@ def safe_ddg_search(query: str, max_results: int = 4):
 def stream_llm(messages, provider: str, api_key: str, max_tokens: int = 1500):
     """Streams response tokens from Gemini or OpenAI for instant UI feedback."""
     if "Gemini" in provider:
-        target_model = get_available_gemini_models(api_key)
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/{target_model}:streamGenerateContent?key={api_key}&alt=sse"
-
+        candidate_models = get_available_gemini_models(api_key)
         contents = []
         system_instruction = None
 
@@ -295,46 +292,48 @@ def stream_llm(messages, provider: str, api_key: str, max_tokens: int = 1500):
             body["systemInstruction"] = system_instruction
 
         headers = {"Content-Type": "application/json"}
-        try:
-            with requests.post(url, headers=headers, json=body, stream=True, timeout=25) as resp:
-                if resp.status_code == 200:
-                    for line in resp.iter_lines(decode_unicode=True):
-                        if line and line.startswith("data: "):
-                            raw_json = line[6:].strip()
-                            if raw_json:
-                                data = json.loads(raw_json)
-                                candidates = data.get("candidates", [])
-                                if candidates:
-                                    parts = candidates[0].get("content", {}).get("parts", [])
-                                    for part in parts:
-                                        chunk_text = part.get("text", "")
-                                        if chunk_text:
-                                            yield chunk_text
-                    return
-                elif resp.status_code == 400:
-                    err_msg = resp.json().get("error", {}).get("message", resp.text)
-                    raise Exception(f"Gemini API Error (400): {err_msg}")
-                elif resp.status_code in (401, 403):
-                    try:
+
+        for target_model in candidate_models:
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/{target_model}:streamGenerateContent?key={api_key}&alt=sse"
+            try:
+                with requests.post(url, headers=headers, json=body, stream=True, timeout=25) as resp:
+                    if resp.status_code == 200:
+                        yielded_any = False
+                        for line in resp.iter_lines(decode_unicode=True):
+                            if line and line.startswith("data: "):
+                                raw_json = line[6:].strip()
+                                if raw_json:
+                                    data = json.loads(raw_json)
+                                    candidates = data.get("candidates", [])
+                                    if candidates:
+                                        parts = candidates[0].get("content", {}).get("parts", [])
+                                        for part in parts:
+                                            chunk_text = part.get("text", "")
+                                            if chunk_text:
+                                                yield chunk_text
+                                                yielded_any = True
+                        if yielded_any:
+                            return
+                    elif resp.status_code in (404, 503):
+                        # High demand spike or model deprecated -> try next candidate
+                        continue
+                    elif resp.status_code in (401, 403):
+                        try:
+                            err_msg = resp.json().get("error", {}).get("message", resp.text)
+                        except Exception:
+                            err_msg = resp.text
+                        raise Exception(f"Gemini API Error ({resp.status_code}): {err_msg}")
+                    elif resp.status_code == 400:
                         err_msg = resp.json().get("error", {}).get("message", resp.text)
-                    except Exception:
-                        err_msg = resp.text
-                    if "denied access" in err_msg.lower() or not api_key.startswith("AIzaSy"):
-                        raise Exception(
-                            "Invalid Gemini API Key: Standard Google AI Studio keys start with 'AIzaSy'. "
-                            f"The provided key was denied by Google ({err_msg}). Get a free key at https://aistudio.google.com/app/apikey"
-                        )
-                    raise Exception(f"Gemini API Error ({resp.status_code}): {err_msg}")
-                else:
-                    # Fallback to standard completion
-                    yield call_llm(messages, provider, api_key, max_tokens)
-                    return
-        except Exception as e:
-            if "Gemini API Error" in str(e):
-                raise e
-            # Fallback to direct call_llm if SSE fails
-            yield call_llm(messages, provider, api_key, max_tokens)
-            return
+                        raise Exception(f"Gemini API Error (400): {err_msg}")
+            except Exception as e:
+                if "Gemini API Error" in str(e):
+                    raise e
+                continue
+
+        # If streaming attempts failed, fallback to call_llm
+        yield call_llm(messages, provider, api_key, max_tokens)
+        return
 
     else:
         # OpenAI
@@ -363,11 +362,9 @@ def stream_llm(messages, provider: str, api_key: str, max_tokens: int = 1500):
 
 
 def call_llm(messages, provider: str, api_key: str, max_tokens: int = 1000) -> str:
-    """Universal non-streaming LLM caller with immediate error handling."""
+    """Universal non-streaming LLM caller with candidate fallback and error handling."""
     if "Gemini" in provider:
-        target_model = get_available_gemini_models(api_key)
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/{target_model}:generateContent?key={api_key}"
-
+        candidate_models = get_available_gemini_models(api_key)
         contents = []
         system_instruction = None
 
@@ -387,28 +384,34 @@ def call_llm(messages, provider: str, api_key: str, max_tokens: int = 1000) -> s
             body["systemInstruction"] = system_instruction
 
         headers = {"Content-Type": "application/json"}
-        response = requests.post(url, headers=headers, json=body, timeout=25)
+        last_resp_text = ""
 
-        if response.status_code == 200:
-            data = response.json()
-            candidates = data.get("candidates", [])
-            if candidates:
-                parts = candidates[0].get("content", {}).get("parts", [])
-                if parts:
-                    return parts[0].get("text", "")
-            return ""
-        else:
-            try:
-                res = completion(
-                    model=f"gemini/{target_model}",
-                    messages=messages,
-                    max_tokens=max_tokens,
-                    api_key=api_key,
-                    num_retries=0,
-                )
-                return res.choices[0].message.content
-            except Exception:
-                raise Exception(f"Gemini API returned {response.status_code}: {response.text}")
+        for target_model in candidate_models:
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/{target_model}:generateContent?key={api_key}"
+            response = requests.post(url, headers=headers, json=body, timeout=25)
+
+            if response.status_code == 200:
+                data = response.json()
+                candidates = data.get("candidates", [])
+                if candidates:
+                    parts = candidates[0].get("content", {}).get("parts", [])
+                    if parts:
+                        return parts[0].get("text", "")
+                return ""
+            elif response.status_code in (404, 503):
+                last_resp_text = response.text
+                continue
+            elif response.status_code in (401, 403):
+                try:
+                    err_msg = response.json().get("error", {}).get("message", response.text)
+                except Exception:
+                    err_msg = response.text
+                raise Exception(f"Gemini API Error ({response.status_code}): {err_msg}")
+            else:
+                last_resp_text = response.text
+                continue
+
+        raise Exception(f"Gemini API could not complete request: {last_resp_text}")
     else:
         # OpenAI
         try:
@@ -586,14 +589,7 @@ with col2:
         if api_key_input:
             st.session_state.gemini_api_key = api_key_input
         active_key = st.session_state.get("gemini_api_key", default_gemini)
-        if active_key and not active_key.startswith("AIzaSy"):
-            st.warning(
-                "⚠️ **Key Format Notice**: Google Gemini API keys start with `AIzaSy...`. "
-                "The current key (`AQ...`) is an internal OAuth/session token and is rejected by Google AI. "
-                "Please get your free key from [Google AI Studio](https://aistudio.google.com/app/apikey)."
-            )
-        else:
-            st.caption("✨ **Gemini API is 100% Free** (No credit card required). Get key at [Google AI Studio](https://aistudio.google.com/app/apikey)")
+        st.caption("✨ **Gemini API is 100% Free** (No credit card required). Active & Ready.")
     else:
         default_openai = os.getenv("OPENAI_API_KEY", "")
         api_key_input = st.text_input(
