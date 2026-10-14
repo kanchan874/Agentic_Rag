@@ -319,6 +319,11 @@ def stream_llm(messages, provider: str, api_key: str, max_tokens: int = 1500):
                         err_msg = resp.json().get("error", {}).get("message", resp.text)
                     except Exception:
                         err_msg = resp.text
+                    if "denied access" in err_msg.lower() or not api_key.startswith("AIzaSy"):
+                        raise Exception(
+                            "Invalid Gemini API Key: Standard Google AI Studio keys start with 'AIzaSy'. "
+                            f"The provided key was denied by Google ({err_msg}). Get a free key at https://aistudio.google.com/app/apikey"
+                        )
                     raise Exception(f"Gemini API Error ({resp.status_code}): {err_msg}")
                 else:
                     # Fallback to standard completion
@@ -581,7 +586,14 @@ with col2:
         if api_key_input:
             st.session_state.gemini_api_key = api_key_input
         active_key = st.session_state.get("gemini_api_key", default_gemini)
-        st.caption("✨ **Gemini API is 100% Free** (No credit card required). Get key at [Google AI Studio](https://aistudio.google.com/app/apikey)")
+        if active_key and not active_key.startswith("AIzaSy"):
+            st.warning(
+                "⚠️ **Key Format Notice**: Google Gemini API keys start with `AIzaSy...`. "
+                "The current key (`AQ...`) is an internal OAuth/session token and is rejected by Google AI. "
+                "Please get your free key from [Google AI Studio](https://aistudio.google.com/app/apikey)."
+            )
+        else:
+            st.caption("✨ **Gemini API is 100% Free** (No credit card required). Get key at [Google AI Studio](https://aistudio.google.com/app/apikey)")
     else:
         default_openai = os.getenv("OPENAI_API_KEY", "")
         api_key_input = st.text_input(
