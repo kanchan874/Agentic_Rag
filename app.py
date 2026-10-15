@@ -1,5 +1,11 @@
 import streamlit as st
-import PyPDF2
+try:
+    import pypdf as PyPDF2
+except ImportError:
+    try:
+        import PyPDF2
+    except ImportError:
+        PyPDF2 = None
 import json
 import requests
 from typing import Optional
@@ -31,6 +37,49 @@ os.environ["LITELLM_TELEMETRY"] = "False"
 litellm.telemetry = False
 litellm.num_retries = 0
 
+def get_secret(key: str, default: str = "") -> str:
+    """Retrieve secret from environment variables or Streamlit secrets."""
+    val = os.getenv(key)
+    if val:
+        return val
+    try:
+        if hasattr(st, "secrets") and key in st.secrets:
+            return str(st.secrets[key])
+    except Exception:
+        pass
+    return default
+
+def get_qdrant_client():
+    """
+    Initializes a resilient Qdrant client:
+    1. Checks for cloud Qdrant via QDRANT_URL and QDRANT_API_KEY (from env or st.secrets).
+    2. Checks for local Qdrant server (http://localhost:6333) used during local development.
+    3. Seamlessly falls back to embedded on-disk Qdrant storage (works anywhere without server, including Streamlit Cloud).
+    """
+    qdrant_url = get_secret("QDRANT_URL", "")
+    qdrant_api_key = get_secret("QDRANT_API_KEY", "")
+
+    if qdrant_url:
+        try:
+            client = QdrantClient(url=qdrant_url, api_key=qdrant_api_key or None, timeout=4.0)
+            client.get_collections()
+            return client
+        except Exception:
+            pass
+
+    # Check local running daemon (localhost:6333)
+    try:
+        client = QdrantClient("http://localhost:6333", timeout=1.0)
+        client.get_collections()
+        return client
+    except Exception:
+        pass
+
+    # Embedded local disk storage (works seamlessly anywhere including Streamlit Community Cloud)
+    storage_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "storage")
+    os.makedirs(storage_path, exist_ok=True)
+    return QdrantClient(path=storage_path)
+
 # Session State Initialization
 if "client" not in st.session_state:
     st.session_state.client = None
@@ -44,7 +93,7 @@ if "last_query" not in st.session_state:
 # Auto-reconnect to existing indexed Qdrant collection on page reload
 if st.session_state.client is None or st.session_state.collection_name is None:
     try:
-        init_client = QdrantClient("http://localhost:6333")
+        init_client = get_qdrant_client()
         existing_cols = [c.name for c in init_client.get_collections().collections]
         if "agent_rag_index" in existing_cols:
             col_info = init_client.get_collection("agent_rag_index")
@@ -235,6 +284,9 @@ def get_embeddings(texts):
 
 def process_uploaded_pdfs(uploaded_files):
     pdf_list = []
+    if PyPDF2 is None:
+        st.error("No PDF extraction library (pypdf or PyPDF2) found. Please ensure `pypdf` is installed.")
+        return pdf_list
     for uploaded_file in uploaded_files:
         content = ""
         try:
@@ -311,7 +363,7 @@ def process_and_index_documents(
     with st.spinner("Generating dense vectors with FastEmbed..."):
         embeddings = get_embeddings(all_chunks)
 
-    client = QdrantClient("http://localhost:6333")
+    client = get_qdrant_client()
     collection_name = "agent_rag_index"
     VECTOR_SIZE = 384
 
@@ -832,7 +884,7 @@ with st.sidebar:
     )
 
     if "Groq" in llm_choice:
-        default_groq = os.getenv("GROQ_API_KEY", "")
+        default_groq = get_secret("GROQ_API_KEY", "")
         api_key_input = st.text_input(
             "Groq API Key",
             value=st.session_state.get("groq_api_key", default_groq),
@@ -849,7 +901,7 @@ with st.sidebar:
             st.markdown('<span class="status-pill-neutral">Key Required</span>', unsafe_allow_html=True)
 
     elif "Gemini" in llm_choice:
-        default_gemini = os.getenv("GEMINI_API_KEY", "")
+        default_gemini = get_secret("GEMINI_API_KEY", "")
         api_key_input = st.text_input(
             "Google Gemini API Key",
             value=st.session_state.get("gemini_api_key", default_gemini),
@@ -866,7 +918,7 @@ with st.sidebar:
             st.markdown('<span class="status-pill-neutral">Key Required</span>', unsafe_allow_html=True)
 
     else:
-        default_openai = os.getenv("OPENAI_API_KEY", "")
+        default_openai = get_secret("OPENAI_API_KEY", "")
         api_key_input = st.text_input(
             "OpenAI API Key",
             value=st.session_state.get("openai_api_key", default_openai),
