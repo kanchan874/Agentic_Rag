@@ -55,8 +55,7 @@ def get_qdrant_client():
     Initializes a resilient, singleton Qdrant client:
     1. Checks for cloud Qdrant via QDRANT_URL and QDRANT_API_KEY (from env or st.secrets).
     2. Checks for local Qdrant server (http://localhost:6333) used during local development.
-    3. Falls back to embedded on-disk Qdrant storage.
-    4. If the directory is locked (e.g. concurrent session on Streamlit Cloud), falls back to in-memory.
+    3. Uses in-memory Qdrant engine when deployed to Streamlit Cloud (zero file-locking issues, zero external setup).
     """
     qdrant_url = get_secret("QDRANT_URL", "")
     qdrant_api_key = get_secret("QDRANT_API_KEY", "")
@@ -69,7 +68,7 @@ def get_qdrant_client():
         except Exception:
             pass
 
-    # Check local running daemon (localhost:6333)
+    # 1. Local standalone daemon (localhost:6333 - used when running qdrant.exe locally)
     try:
         client = QdrantClient("http://localhost:6333", timeout=1.0)
         client.get_collections()
@@ -77,14 +76,9 @@ def get_qdrant_client():
     except Exception:
         pass
 
-    # Embedded local disk storage
-    try:
-        storage_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "storage")
-        os.makedirs(storage_path, exist_ok=True)
-        return QdrantClient(path=storage_path)
-    except Exception:
-        # If disk storage is already locked or inaccessible, gracefully fall back to in-memory
-        return QdrantClient(location=":memory:")
+    # 2. Cloud deployment fallback:
+    # Use in-memory Qdrant. Fast, isolated, zero portalocker / file-locking conflicts in containerized clouds.
+    return QdrantClient(location=":memory:")
 
 # Session State Initialization
 if "client" not in st.session_state:
