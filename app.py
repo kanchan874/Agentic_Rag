@@ -49,12 +49,14 @@ def get_secret(key: str, default: str = "") -> str:
         pass
     return default
 
+@st.cache_resource
 def get_qdrant_client():
     """
-    Initializes a resilient Qdrant client:
+    Initializes a resilient, singleton Qdrant client:
     1. Checks for cloud Qdrant via QDRANT_URL and QDRANT_API_KEY (from env or st.secrets).
     2. Checks for local Qdrant server (http://localhost:6333) used during local development.
-    3. Seamlessly falls back to embedded on-disk Qdrant storage (works anywhere without server, including Streamlit Cloud).
+    3. Falls back to embedded on-disk Qdrant storage.
+    4. If the directory is locked (e.g. concurrent session on Streamlit Cloud), falls back to in-memory.
     """
     qdrant_url = get_secret("QDRANT_URL", "")
     qdrant_api_key = get_secret("QDRANT_API_KEY", "")
@@ -75,10 +77,14 @@ def get_qdrant_client():
     except Exception:
         pass
 
-    # Embedded local disk storage (works seamlessly anywhere including Streamlit Community Cloud)
-    storage_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "storage")
-    os.makedirs(storage_path, exist_ok=True)
-    return QdrantClient(path=storage_path)
+    # Embedded local disk storage
+    try:
+        storage_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "storage")
+        os.makedirs(storage_path, exist_ok=True)
+        return QdrantClient(path=storage_path)
+    except Exception:
+        # If disk storage is already locked or inaccessible, gracefully fall back to in-memory
+        return QdrantClient(location=":memory:")
 
 # Session State Initialization
 if "client" not in st.session_state:
