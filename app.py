@@ -722,8 +722,17 @@ def answer_question(
 
     def search(text: str):
         query_embedding = get_embeddings(text)[0]
+        if hasattr(client, "query_points"):
+            response = client.query_points(
+                collection_name=collection_name,
+                query=query_embedding,
+                limit=top_k,
+            )
+            return response.points
         return client.search(
-            collection_name=collection_name, query_vector=query_embedding, limit=top_k
+            collection_name=collection_name,
+            query_vector=query_embedding,
+            limit=top_k,
         )
 
     def format_docs(docs):
