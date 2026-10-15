@@ -53,12 +53,15 @@ def get_secret(key: str, default: str = "") -> str:
 def get_qdrant_client():
     """
     Initializes a resilient, singleton Qdrant client:
-    1. Checks for cloud Qdrant via QDRANT_URL and QDRANT_API_KEY (from env or st.secrets).
+    1. Checks for cloud Qdrant via QDRANT_URL and QDRANT_API_KEY (from env, st.secrets, or cluster default).
     2. Checks for local Qdrant server (http://localhost:6333) used during local development.
     3. Uses in-memory Qdrant engine when deployed to Streamlit Cloud (zero file-locking issues, zero external setup).
     """
-    qdrant_url = get_secret("QDRANT_URL", "").strip()
-    qdrant_api_key = get_secret("QDRANT_API_KEY", "").strip()
+    default_cloud_url = "https://e6110584-3354-42d6-9b93-8f2f36d606ba.eu-central-1-0.aws.cloud.qdrant.io:6333"
+    default_cloud_key = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJhY2Nlc3MiOiJtIiwic3ViamVjdCI6ImFwaS1rZXk6ZDU4N2E2MDgtZmQwZi00NTBhLTk4M2ItNTI3NzQyNWM3NmY4In0.8GrFigT8rKJnxRwsuWhKvFxDL65GDebuoaezyDUh0Cw"
+
+    qdrant_url = get_secret("QDRANT_URL", default_cloud_url).strip()
+    qdrant_api_key = get_secret("QDRANT_API_KEY", default_cloud_key).strip()
 
     # 1. Cloud Qdrant cluster (e.g. cloud.qdrant.io)
     if qdrant_url:
@@ -83,8 +86,9 @@ def get_qdrant_client():
 
 def get_database_label() -> str:
     """Return friendly label for current active vector database."""
-    if get_secret("QDRANT_URL", "").strip():
-        return "Qdrant Cloud"
+    default_cloud_url = "https://e6110584-3354-42d6-9b93-8f2f36d606ba.eu-central-1-0.aws.cloud.qdrant.io:6333"
+    if get_secret("QDRANT_URL", default_cloud_url).strip():
+        return "Qdrant Cloud (Managed Cluster)"
     try:
         c = QdrantClient("http://localhost:6333", timeout=0.5)
         c.get_collections()
