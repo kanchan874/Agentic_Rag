@@ -57,18 +57,19 @@ def get_qdrant_client():
     2. Checks for local Qdrant server (http://localhost:6333) used during local development.
     3. Uses in-memory Qdrant engine when deployed to Streamlit Cloud (zero file-locking issues, zero external setup).
     """
-    qdrant_url = get_secret("QDRANT_URL", "")
-    qdrant_api_key = get_secret("QDRANT_API_KEY", "")
+    qdrant_url = get_secret("QDRANT_URL", "").strip()
+    qdrant_api_key = get_secret("QDRANT_API_KEY", "").strip()
 
+    # 1. Cloud Qdrant cluster (e.g. cloud.qdrant.io)
     if qdrant_url:
         try:
-            client = QdrantClient(url=qdrant_url, api_key=qdrant_api_key or None, timeout=4.0)
+            client = QdrantClient(url=qdrant_url, api_key=qdrant_api_key or None, timeout=12.0)
             client.get_collections()
             return client
         except Exception:
             pass
 
-    # 1. Local standalone daemon (localhost:6333 - used when running qdrant.exe locally)
+    # 2. Local standalone daemon (localhost:6333 - used when running qdrant.exe locally)
     try:
         client = QdrantClient("http://localhost:6333", timeout=1.0)
         client.get_collections()
@@ -76,9 +77,20 @@ def get_qdrant_client():
     except Exception:
         pass
 
-    # 2. Cloud deployment fallback:
+    # 3. Cloud deployment fallback:
     # Use in-memory Qdrant. Fast, isolated, zero portalocker / file-locking conflicts in containerized clouds.
     return QdrantClient(location=":memory:")
+
+def get_database_label() -> str:
+    """Return friendly label for current active vector database."""
+    if get_secret("QDRANT_URL", "").strip():
+        return "Qdrant Cloud"
+    try:
+        c = QdrantClient("http://localhost:6333", timeout=0.5)
+        c.get_collections()
+        return "Qdrant Local (localhost:6333)"
+    except Exception:
+        return "Qdrant In-Memory"
 
 # Session State Initialization
 if "client" not in st.session_state:
@@ -938,7 +950,7 @@ with st.sidebar:
         st.markdown(
             f"""
             <div style="font-size: 0.84rem; line-height: 1.6;">
-                <strong>Database:</strong> Qdrant Local<br/>
+                <strong>Database:</strong> {get_database_label()}<br/>
                 <strong>Collection:</strong> <code>{st.session_state.collection_name}</code><br/>
                 <strong>Indexed Chunks:</strong> <code>{st.session_state.indexed_count}</code><br/>
                 <strong>Embeddings:</strong> FastEmbed BGE-small
